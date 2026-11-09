@@ -1,0 +1,8 @@
+[Unit]
+Description=Schedule configured RTC wake and power off
+Wants=time-sync.target
+After=time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/autopower run

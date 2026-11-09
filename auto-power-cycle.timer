@@ -1,0 +1,11 @@
+[Unit]
+Description=Power off daily at the configured local time
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=false
+AccuracySec=1s
+Unit=auto-power-cycle.service
+
+[Install]
+WantedBy=timers.target

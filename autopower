@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# Shared CLI/backend for scheduled poweroff and RTC wake.
+set -Eeuo pipefail
+
+readonly CONFIG_FILE=/etc/auto-power-cycle.conf
+readonly STATE_DIR=/var/lib/auto-power-cycle
+readonly TEST_PENDING="$STATE_DIR/test-pending"
+readonly TEST_RESULT="$STATE_DIR/last-test-result"
+readonly LOCK_FILE=/run/lock/auto-power-cycle.lock
+readonly TIMER_NAME=auto-power-cycle.timer
+readonly TIMER_DROP_IN_DIR=/etc/systemd/system/auto-power-cycle.timer.d
+readonly TIMER_DROP_IN="$TIMER_DROP_IN_DIR/schedule.conf"
+
+SHUTDOWN_TIME=00:00:00
+WAKE_TIME=06:00:00
+DAILY_ENABLED=1
+
+log() {
+    /usr/bin/logger --tag auto-power-cycle -- "$*"
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf '错误：%s\n' "$*" >&2
+    exit 1
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        die '此操作需要管理员权限，请在命令前加 sudo。'
+    fi
+}
+
+require_utc() {
+    if [[ "$(/usr/bin/timedatectl show --property=LocalRTC --value)" != no ]]; then
+        die '硬件时钟必须使用 UTC，当前配置不能安全执行 RTC 唤醒。'
+    fi
+}
+
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    /usr/bin/flock --nonblock 9 || die '另一个配置、关机或测试操作正在执行，请稍后重试。'
+}
+
+normalize_time() {
+    local value="${1:-}"
+    if [[ "$value" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+        printf '%s:00\n' "$value"
+    elif [[ "$value" =~ ^([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])$ ]]; then
+        printf '%s\n' "$value"
+    else
+        return 1
+    fi
+}
+
+load_config() {
+    local normalized
+    if [[ -r "$CONFIG_FILE" ]]; then
+        # This file is installed root:root 0644 and written only by set_schedule.
+        source "$CONFIG_FILE"
+    elif [[ -e "$CONFIG_FILE" ]]; then
+        die "无法读取配置文件 $CONFIG_FILE。"
+    fi
+
+    if ! normalized=$(normalize_time "$SHUTDOWN_TIME"); then
+        die "配置中的自动关机时间无效：$SHUTDOWN_TIME"
+    fi
+    SHUTDOWN_TIME="$normalized"
+    if ! normalized=$(normalize_time "$WAKE_TIME"); then
+        die "配置中的自动开机时间无效：$WAKE_TIME"
+    fi
+    WAKE_TIME="$normalized"
+    if [[ "$DAILY_ENABLED" != 0 && "$DAILY_ENABLED" != 1 ]]; then
+        die "配置中的 DAILY_ENABLED 必须为 0 或 1，当前为：$DAILY_ENABLED"
+    fi
+}
+
+show_help() {
+    /usr/bin/cat <<'HELP'
+autopower — 自动开关机工具
+=========================
+
+只有一个命令：autopower。on/off/now/set 都是它的参数。
+
+常用用法：
+  sudo autopower on                         启用每日自动计划
+  sudo autopower on -s 00:00 -w 06:00       设置时间并启用每日计划
+  sudo autopower off                        停用每日自动计划（不是立即关机）
+  sudo autopower set -s 23:30 -w 06:30      修改时间，不改变启用/停用状态
+  sudo autopower now                        立即正常关机，并按 -w 设定的时间开机
+  autopower now --dry-run                   只预览 now 的结果，不写 RTC、不关机
+  autopower status                          查看配置、定时器和测试结果
+  autopower help                            显示本帮助
+
+参数：
+  -s, --shutdown <时间>       每日自动关机时间
+  -w, --wake <时间>           自动开机时间，也用于 autopower now
+  --dry-run                   仅预览，不修改闹钟或电源状态
+
+立即关机示例：
+  # 先设置每天 00:00 关机、06:00 开机并启用
+  sudo autopower on -s 00:00 -w 06:00
+
+  # 保存工作后立即关机；如果现在是 22:00，将在次日 06:00 开机
+  sudo autopower now
+
+  # 预览下一次开机时间，不会真正关机
+  autopower now --dry-run
+
+时间格式与校验：
+  使用 24 小时制 HH:MM 或 HH:MM:SS，按北京时间（Asia/Shanghai）解释。
+  小时为 00～23，分钟和秒为 00～59；不足两位必须补零。
+  正确：00:00、06:00、23:30:15
+  错误：6:00、24:00、12:60、06:00:99
+  无效时间会报错，原有配置不会被修改。
+  如果当天开机时间已过去或距离现在不足 60 秒，autopower now 选择次日。
+  RTC 硬件时钟使用 UTC，工具自动完成北京时间与 UTC 的换算。
+
+高级操作：
+  autopower next-wake                 显示下一次手动关机对应的唤醒时间
+  sudo autopower cancel-wake          清除尚未触发的 RTC 闹钟
+  sudo autopower test [120～3600]      真关机测试，在指定秒数后唤醒
+
+日志：
+  journalctl -t auto-power-cycle --no-pager
+  /var/log/auto-power-cycle-install.log
+  /var/lib/auto-power-cycle/last-test-result
+
+注意：now 和 test 会真正关机，VNC/SSH 会断开，请先保存工作。
+关机期间必须保持交流电和电源待机供电，不能关闭插排。
+HELP
+}
+
+show_config() {
+    load_config
+    printf 'SHUTDOWN_TIME=%s\nWAKE_TIME=%s\nDAILY_ENABLED=%s\n' \
+        "$SHUTDOWN_TIME" "$WAKE_TIME" "$DAILY_ENABLED"
+}
+
+next_wake_epoch() {
+    local now target
+    now=$(/usr/bin/date +%s)
+    target=$(/usr/bin/date --date="today $WAKE_TIME" +%s)
+    if (( target <= now + 60 )); then
+        target=$(/usr/bin/date --date="tomorrow $WAKE_TIME" +%s)
+    fi
+    printf '%s\n' "$target"
+}
+
+show_next_wake() {
+    load_config
+    local wake_epoch
+    wake_epoch=$(next_wake_epoch)
+    printf 'NEXT_WAKE_EPOCH=%s\n' "$wake_epoch"
+    printf 'NEXT_WAKE_TIME=%s\n' "$(/usr/bin/date --date="@$wake_epoch" '+%F %T %Z')"
+}
+
+write_config() {
+    local temporary="$CONFIG_FILE.tmp.$$"
+    printf 'SHUTDOWN_TIME=%s\nWAKE_TIME=%s\nDAILY_ENABLED=%s\n' \
+        "$SHUTDOWN_TIME" "$WAKE_TIME" "$DAILY_ENABLED" > "$temporary"
+    /usr/bin/chown root:root "$temporary"
+    /usr/bin/chmod 0644 "$temporary"
+    /usr/bin/mv "$temporary" "$CONFIG_FILE"
+}
+
+write_timer_drop_in() {
+    local temporary
+    /usr/bin/install -d -m 0755 "$TIMER_DROP_IN_DIR"
+    temporary="$TIMER_DROP_IN.tmp.$$"
+    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* %s\n' "$SHUTDOWN_TIME" > "$temporary"
+    /usr/bin/chown root:root "$temporary"
+    /usr/bin/chmod 0644 "$temporary"
+    /usr/bin/mv "$temporary" "$TIMER_DROP_IN"
+}
+
+apply_timer_state() {
+    write_timer_drop_in
+    /usr/bin/systemctl daemon-reload
+    if [[ "$DAILY_ENABLED" == 1 ]]; then
+        /usr/bin/systemctl enable "$TIMER_NAME"
+        /usr/bin/systemctl restart "$TIMER_NAME"
+    else
+        /usr/bin/systemctl disable --now "$TIMER_NAME"
+    fi
+}
+
+set_schedule() {
+    local new_shutdown="$SHUTDOWN_TIME"
+    local new_wake="$WAKE_TIME"
+    local new_enabled="$DAILY_ENABLED"
+    local changed=0
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -s|--shutdown)
+                (( $# >= 2 )) || die "$1 后缺少时间参数。"
+                new_shutdown="$2"
+                changed=1
+                shift 2
+                ;;
+            -w|--wake)
+                (( $# >= 2 )) || die "$1 后缺少时间参数。"
+                new_wake="$2"
+                changed=1
+                shift 2
+                ;;
+            --enabled)
+                (( $# >= 2 )) || die '--enabled 后缺少 0 或 1。'
+                new_enabled="$2"
+                changed=1
+                shift 2
+                ;;
+            *)
+                die "未知参数：$1；请使用 autopower help 查看示例。"
+                ;;
+        esac
+    done
+
+    (( changed == 1 )) || die 'set 至少需要一个参数：-s/--shutdown、-w/--wake 或 --enabled。'
+    if ! SHUTDOWN_TIME=$(normalize_time "$new_shutdown"); then
+        die "自动关机时间无效：$new_shutdown；正确格式为 HH:MM 或 HH:MM:SS，例如 00:00。配置未修改。"
+    fi
+    if ! WAKE_TIME=$(normalize_time "$new_wake"); then
+        die "自动开机时间无效：$new_wake；正确格式为 HH:MM 或 HH:MM:SS，例如 06:00。配置未修改。"
+    fi
+    if [[ "$new_enabled" != 0 && "$new_enabled" != 1 ]]; then
+        die "--enabled 只能为 0（停用）或 1（启用）。配置未修改。"
+    fi
+    DAILY_ENABLED="$new_enabled"
+
+    write_config
+    apply_timer_state
+    log "每日计划已保存：关机 $SHUTDOWN_TIME，开机 $WAKE_TIME，启用 $DAILY_ENABLED。"
+}
+
+set_daily_enabled() {
+    DAILY_ENABLED="$1"
+    write_config
+    apply_timer_state
+    if [[ "$DAILY_ENABLED" == 1 ]]; then
+        log "每日自动计划已启用：关机 $SHUTDOWN_TIME，开机 $WAKE_TIME。"
+    else
+        log '每日自动计划已停用；已有 RTC 闹钟未修改。'
+    fi
+}
+
+schedule_poweroff() {
+    local dry_run=0
+    case "${1:-}" in
+        '') ;;
+        --dry-run) dry_run=1 ;;
+        *) die 'now 只支持 --dry-run；真实关机请执行 sudo autopower now。' ;;
+    esac
+    (( $# <= 1 )) || die 'now 参数过多。'
+
+    load_config
+    local wake_epoch wake_text
+    wake_epoch=$(next_wake_epoch)
+    wake_text=$(/usr/bin/date --date="@$wake_epoch" '+%F %T %Z')
+
+    if (( dry_run == 1 )); then
+        printf 'DRY_RUN=1（仅预览，未写 RTC，未关机）\n'
+        printf 'ACTION=立即正常关机\n'
+        printf 'WAKE_AT=%s\n' "$wake_text"
+        return 0
+    fi
+
+    require_root
+    require_utc
+    acquire_lock
+    log "即将正常关机；RTC 自动开机时间：$wake_text。"
+    /usr/sbin/rtcwake --mode off --utc --time "$wake_epoch"
+}
+
+cancel_wake() {
+    require_root
+    acquire_lock
+    require_utc
+    /usr/sbin/rtcwake --mode disable
+    log '已清除尚未触发的 RTC 自动开机闹钟。'
+}
+
+run_poweroff_test() {
+    local delay="${1:-300}"
+    local requested_epoch expected_epoch temporary
+    load_config
+    require_root
+    require_utc
+    acquire_lock
+
+    if [[ ! "$delay" =~ ^[0-9]+$ ]] || (( delay < 120 || delay > 3600 )); then
+        die '测试延迟必须是 120～3600 之间的整数秒。'
+    fi
+    if [[ -e "$TEST_PENDING" ]]; then
+        die '已有一个等待开机验证的测试，不能重复启动。'
+    fi
+
+    requested_epoch=$(/usr/bin/date +%s)
+    expected_epoch=$((requested_epoch + delay))
+    temporary="$TEST_PENDING.tmp.$$"
+    /usr/bin/install -d -m 0755 "$STATE_DIR"
+    printf 'REQUESTED_AT_EPOCH=%s\nEXPECTED_WAKE_EPOCH=%s\nDAILY_ENABLED_AT_TEST=%s\n' \
+        "$requested_epoch" "$expected_epoch" "$DAILY_ENABLED" > "$temporary"
+    /usr/bin/chmod 0600 "$temporary"
+    /usr/bin/mv "$temporary" "$TEST_PENDING"
+
+    /usr/bin/systemctl disable --now "$TIMER_NAME"
+    /usr/bin/systemctl enable auto-power-cycle-test-verify.service
+    log "RTC 测试：现在正常关机，预计 $(/usr/bin/date --date="@$expected_epoch" '+%F %T %Z') 自动开机。"
+
+    if ! /usr/sbin/rtcwake --mode off --utc --seconds "$delay"; then
+        log 'RTC 测试启动失败，恢复每日定时器。'
+        /usr/bin/rm -f "$TEST_PENDING"
+        /usr/bin/systemctl disable auto-power-cycle-test-verify.service
+        apply_timer_state
+        exit 1
+    fi
+}
+
+verify_test_boot() {
+    local now delta temporary
+    load_config
+    require_root
+    acquire_lock
+    if [[ ! -r "$TEST_PENDING" ]]; then
+        exit 0
+    fi
+
+    # Root-owned 0600 state file written only by run_poweroff_test.
+    source "$TEST_PENDING"
+    now=$(/usr/bin/date +%s)
+    delta=$((now - EXPECTED_WAKE_EPOCH))
+    temporary="$TEST_RESULT.tmp.$$"
+    {
+        printf 'REQUESTED_AT=%s\n' "$(/usr/bin/date --date="@$REQUESTED_AT_EPOCH" '+%F %T %Z')"
+        printf 'EXPECTED_WAKE=%s\n' "$(/usr/bin/date --date="@$EXPECTED_WAKE_EPOCH" '+%F %T %Z')"
+        printf 'BOOT_OBSERVED=%s\n' "$(/usr/bin/date --date="@$now" '+%F %T %Z')"
+        printf 'DELTA_SECONDS=%s\n' "$delta"
+        printf 'CONFIGURED_SHUTDOWN=%s\n' "$SHUTDOWN_TIME"
+        printf 'CONFIGURED_WAKE=%s\n' "$WAKE_TIME"
+        printf 'DAILY_ENABLED_AT_TEST=%s\n' "$DAILY_ENABLED_AT_TEST"
+        printf 'RESULT=Boot observed after RTC test; compare timestamps to confirm.\n'
+    } > "$temporary"
+    /usr/bin/chmod 0644 "$temporary"
+    /usr/bin/mv "$temporary" "$TEST_RESULT"
+    /usr/bin/rm -f "$TEST_PENDING"
+
+    apply_timer_state
+    /usr/bin/systemctl disable auto-power-cycle-test-verify.service
+    log "RTC 测试开机已记录：$(/usr/bin/date --date="@$now" '+%F %T %Z')，与闹钟相差 ${delta} 秒；每日计划状态已恢复。"
+}
+
+show_status() {
+    load_config
+    local enabled_text wake_epoch
+    if [[ "$DAILY_ENABLED" == 1 ]]; then enabled_text='启用'; else enabled_text='停用'; fi
+    printf '%s\n' '--- 当前配置 ---'
+    printf '每日自动关机：%s\n' "$enabled_text"
+    printf '自动关机时间：%s（北京时间）\n' "$SHUTDOWN_TIME"
+    printf '自动开机时间：%s（北京时间）\n' "$WAKE_TIME"
+    wake_epoch=$(next_wake_epoch)
+    printf '现在手动关机后的开机时间：%s\n' "$(/usr/bin/date --date="@$wake_epoch" '+%F %T %Z')"
+
+    printf '%s\n' '--- systemd 定时器 ---'
+    printf 'enabled=%s\n' "$(/usr/bin/systemctl is-enabled "$TIMER_NAME" 2>/dev/null || true)"
+    printf 'active=%s\n' "$(/usr/bin/systemctl is-active "$TIMER_NAME" 2>/dev/null || true)"
+    /usr/bin/systemctl list-timers "$TIMER_NAME" --all --no-pager
+
+    printf '%s\n' '--- RTC 闹钟 ---'
+    if (( EUID == 0 )); then
+        /usr/sbin/rtcwake --mode show --utc || true
+    else
+        /usr/bin/grep -E '^(alrm_time|alrm_date|alarm_IRQ|alrm_pending)' /proc/driver/rtc || true
+        printf '提示：使用 sudo 查询可显示完整 RTC 闹钟。\n'
+    fi
+
+    if [[ -r "$TEST_RESULT" ]]; then
+        printf '%s\n' '--- 最近一次测试结果 ---'
+        /usr/bin/cat "$TEST_RESULT"
+    fi
+}
+
+case "${1:-status}" in
+    help|--help|-h)
+        show_help
+        ;;
+    get)
+        show_config
+        ;;
+    next-wake)
+        show_next_wake
+        ;;
+    set)
+        shift
+        if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then show_help; exit 0; fi
+        require_root
+        load_config
+        acquire_lock
+        set_schedule "$@"
+        ;;
+    on|enable)
+        shift
+        if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then show_help; exit 0; fi
+        require_root
+        load_config
+        acquire_lock
+        if (( $# > 0 )); then
+            set_schedule --enabled 1 "$@"
+        else
+            set_daily_enabled 1
+        fi
+        ;;
+    off|disable)
+        shift
+        (( $# == 0 )) || die 'off 不接受其他参数；立即关机并定时开机请使用 autopower now。'
+        require_root
+        load_config
+        acquire_lock
+        set_daily_enabled 0
+        ;;
+    now|poweroff)
+        shift
+        if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then show_help; exit 0; fi
+        schedule_poweroff "$@"
+        ;;
+    run)
+        schedule_poweroff
+        ;;
+    cancel-wake)
+        cancel_wake
+        ;;
+    test)
+        shift
+        if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then show_help; exit 0; fi
+        run_poweroff_test "${1:-300}"
+        ;;
+    verify-test)
+        verify_test_boot
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        printf '错误：未知命令：%s\n\n' "$1" >&2
+        show_help >&2
+        exit 2
+        ;;
+esac

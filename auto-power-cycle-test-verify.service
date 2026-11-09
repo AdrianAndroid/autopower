@@ -1,0 +1,12 @@
+[Unit]
+Description=Record RTC test boot and restore configured daily schedule
+Wants=time-sync.target
+After=time-sync.target
+ConditionPathExists=/var/lib/auto-power-cycle/test-pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/autopower verify-test
+
+[Install]
+WantedBy=multi-user.target
