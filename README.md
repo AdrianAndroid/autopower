@@ -2,11 +2,34 @@
 
 ## 当前版本
 
-本阶段按用户要求只交付 **CLI**，GUI/桌面双击版本尚未实现。
+本阶段提供两种用法：命令行 `autopower`（唯一实现与后台服务），以及一个**桌面双击即可打开的原生图形界面**（Python 3 + GTK3，不依赖任何额外安装的软件包）。两者读写同一份配置与同一套 systemd 定时器。
 
 只安装一个命令：`autopower`。`on/off/now/set` 都是该命令的参数，不是独立程序。旧路径 `/usr/local/sbin/auto-power-cycle` 只是兼容链接，实际指向 `/usr/local/bin/autopower`。
 
 当前保留的计划为：每天 **00:00 关机，06:00 自动开机**，时区为 Asia/Shanghai（北京时间）。
+
+## 桌面界面（GUI）
+
+![自动开关机主窗口](docs/images/ui-main.png)
+
+界面精简到一屏，全部操作都不需要输入密码之外的打字：
+
+- **关机 / 开机时间各一组 `− 时间 ＋`**，每次固定调半小时；没有文本输入框，避免格式报错。`00:00` 再按 `−` 会绕到 `23:30`，`23:30` 再按 `＋` 回到 `00:00`。
+- **没有保存按钮**：每次按 `−／＋`（以及切换「启用」开关）都会在 0.6 秒内自动保存，并把配置读回来逐项校验，结果显示在下方日志区。
+- **按钮分级**：`立即关机` 保持正常大小，`预览`、`唤醒测试`、`清闹钟`、`刷新` 收为小号，不干扰主功能。
+- **鼠标悬停显示说明**：每个控件都有中文 tooltip，不弹窗、不遮挡界面。
+
+![悬停「关机 ＋」时的说明](docs/images/ui-tooltip.png)
+
+安装与启动（幂等，可重复执行）：
+
+```bash
+cd ~/ubuntu/power-schedule
+sudo bash ui/setup-autopower-ui.sh     # 安装启动器、桌面图标与免密规则
+# 之后双击桌面「Autopower」图标，或在终端执行 autopower-gui
+```
+
+脚本会写入 `/etc/sudoers.d/autopower-ui`，只允许 `zhaojian` 免密执行 `/usr/local/bin/autopower`；删除该文件即可撤销免密。界面里的「立即关机」「唤醒测试」都会真正关机，执行前会先弹出应用内的确认条（Esc 取消）。
 
 ## 最常用操作
 
@@ -88,6 +111,10 @@ sudo autopower now
 | `/etc/auto-power-cycle.conf` | 关机时间、开机时间、每日计划启用状态 |
 | `/etc/systemd/system/auto-power-cycle.timer.d/schedule.conf` | 根据配置生成的 `OnCalendar` |
 | `/usr/local/bin/autopower` | 唯一 CLI/后台实现 |
+| `/etc/sudoers.d/autopower-ui` | GUI 免密执行 `autopower` 的规则（删除即撤销） |
+| `~/.local/bin/autopower-gui` | 桌面界面的启动器 |
+| `~/.local/share/applications/autopower-gui.desktop` | 应用菜单项 |
+| `~/Desktop/autopower-gui.desktop` | 桌面双击图标 |
 | `/etc/systemd/system/auto-power-cycle.service` | 每日定时关机服务 |
 | `/etc/systemd/system/auto-power-cycle.timer` | 每日定时器 |
 | `/etc/systemd/system/auto-power-cycle-test-verify.service` | 真关机测试后的启动验证与状态恢复 |
@@ -101,6 +128,9 @@ sudo autopower now
 - `auto-power-cycle.timer`
 - `auto-power-cycle-test-verify.service`
 - `setup-auto-power-cycle.sh`
+- `ui/autopower_gui.py`（GTK3 桌面界面）
+- `ui/setup-autopower-ui.sh`（界面启动器与桌面项安装脚本）
+- `docs/images/`（README 截图）
 - `README.md`
 - `operation-log.md`
 
@@ -130,7 +160,11 @@ sudo autopower test 300
 
 测试会暂停每日 timer，设置 300 秒后的 RTC 闹钟并关机；首次启动后自动写入测试结果并恢复配置中的每日计划状态。测试延迟允许 `120～3600` 秒。
 
-本次 CLI 升级只执行了 dry-run、配置和时间校验测试，**没有再次执行真实关机**。旧版已在 2026-11-09 00:12～00:17 完成一次成功的 5 分钟 RTC 真关机唤醒测试。
+图形界面里的「唤醒测试」按钮等同于 `autopower test <界面上填的秒数>`，同样会真关机，点击后先弹出确认条。
+
+CLI 升级阶段只执行了 dry-run、配置和时间校验测试，**没有再次执行真实关机**。旧版已在 2026-11-09 00:12～00:17 完成一次成功的 5 分钟 RTC 真关机唤醒测试。
+
+桌面界面在真机上完成过两次 RTC 真关机唤醒测试，实测记录（`/var/lib/auto-power-cycle/last-test-result`）：请求 00:55:16、预期 01:00:16、实际启动 01:00:36，差值 20 秒；醒来后自动恢复每日计划 `00:00 关机 / 06:00 开机`。
 
 ## 硬件依据与注意事项
 
